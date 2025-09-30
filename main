@@ -1,0 +1,274 @@
+!pip -q install phonenumbers openpyxl
+
+import re
+import pandas as pd
+import phonenumbers
+from datetime import datetime
+
+INPUT_XLSX_PATH = "/content/data (55).xlsx"
+SHEET_NAME = 0
+OUTPUT_XLSX_PATH = "/content/base_limpa.xlsx"
+OUTPUT_CSV_PATH  = "/content/omnichat_contacts.csv"
+
+# Regras de "baixo potencial" (ajuste se quiser)
+LOW_POTENTIAL = {
+    "min_ticket_medio": 150.0,  
+    "min_limite_disponivel": 100.0 
+}
+def normalize_cols(df):
+    """Normaliza cabeçalhos p/ snake_case sem acento."""
+    def norm(s):
+        s = str(s).strip().lower()
+        repl = (("ç","c"),("á","a"),("à","a"),("â","a"),("ã","a"),
+                ("é","e"),("ê","e"),("í","i"),
+                ("ó","o"),("ô","o"),("õ","o"),
+                ("ú","u"),("ü","u"))
+        for a,b in repl: s = s.replace(a,b)
+        s = re.sub(r"[^\w\s]", " ", s)   # remove pontuação
+        s = re.sub(r"\s+", " ", s).strip()
+        s = s.replace(" ", "_")
+        return s
+    df.columns = [norm(c) for c in df.columns]
+    return df
+
+def normalize_br_phone(raw):
+    """Retorna +55XXXXXXXXXXX (E.164) ou None se inválido."""
+    if pd.isna(raw): return None
+    s = re.sub(r"[^\d+]", "", str(raw))
+    try:
+        num = phonenumbers.parse(s, "BR") if not s.startswith("+") else phonenumbers.parse(s, None)
+        if not phonenumbers.is_valid_number(num): return None
+        return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
+        digits = re.sub(r"\D","", s)
+        if 10 <= len(digits) <= 11:
+            try:
+                num = phonenumbers.parse(digits, "BR")
+                if phonenumbers.is_valid_number(num):
+                    return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+            except Exception:
+                return None
+        return None
+
+def clean_name(x):
+    if pd.isna(x): return None
+    s = re.sub(r"\s+", " ", str(x).strip())
+    return s if s else None
+
+def parse_money(val):
+    """
+    Converte valores BR em float.
+    Suporta: 'R$ 1.234,56', '1.234,56', '1234,56', '1,234.56', '1234.56', etc.
+    """
+    if pd.isna(val): return None
+    s = str(val).strip()
+    if not s: return None
+    # remove R$ e espaços
+    s = s.replace("R$", "").replace("r$", "").strip()
+    # remove qualquer caractere que não seja dígito, vírgula, ponto ou sinal
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    # Heurística: se tem vírgula e ponto -> decide pelo último separador como decimal
+    if "," in s and "." in s:
+        # Se o último separador for vírgula, vírgula é decimal; do contrário, ponto é decimal
+        if s.rfind(",") > s.rfind("."):
+            s = s.replace(".", "")     # remove milhares
+            s = s.replace(",", ".")    # decimal
+        else:
+            s = s.replace(",", "")     # remove milhares, ponto decimal já ok
+    elif "," in s:
+        # Provavelmente BR: vírgula decimal
+        s = s.replace(".", "")         # remove milhares
+        s = s.replace(",", ".")        # decimal
+    # se só tem ponto, assume ponto como decimal
+    try:
+        return float(s)
+    except:
+        return pd.to_numeric(s, errors="coerce")
+
+
+def to_num(series):
+    return series.apply(parse_money)
+
+def pick_latest_duplicate(group):
+    """Mantém registro mais recente por 'ultima_transacao' ou 'ultima_compra' se existirem."""
+    cols_dt = [c for c in ["ultima_transacao","ultima_compra"] if c in group.columns]
+    if cols_dt:
+        tmp = group.copy()
+        for c in cols_dt:
+            tmp[c] = pd.to_datetime(tmp[c], errors="coerce", dayfirst=True)
+        tmp["__dtref"] = tmp[cols_dt].max(axis=1)
+        tmp = tmp.sort_values("__dtref", ascending=False, na_position="last")
+        return tmp.iloc[0]
+    return group.iloc[0]
+
+
+def filter_low_potential(df):
+    mask = pd.Series(True, index=df.index)
+    if "ticket_medio" in df.columns:
+        mask &= (to_num(df["ticket_medio"]).fillna(0) >= LOW_POTENTIAL["min_ticket_medio"])
+    if "limite_disponivel" in df.columns:
+        mask &= (to_num(df["limite_disponivel"]).fillna(0) >= LOW_POTENTIAL["min_limite_disponivel"])
+    removed = (~mask).sum()
+    return df[mask].copy(), removed
+
+
+def coalesce_columns(df, targets_map):
+    """
+    Para cada chave destino (ex.: 'limite_disponivel'), tenta preencher a partir
+    de múltiplos possíveis nomes origem presentes na base.
+    """
+    for dest, candidates in targets_map.items():
+        if dest not in df.columns:
+            df[dest] = None
+        for c in candidates:
+            if c in df.columns:
+                df[dest] = df[dest].fillna(df[c])
+    return df
+
+
+# ======== PIPELINE ========
+# 1) leitura original (mantida para auditoria)
+df_raw = pd.read_excel(INPUT_XLSX_PATH, sheet_name=SHEET_NAME, dtype=str)
+orig_cols = list(df_raw.columns)
+orig_rows = len(df_raw)
+
+# 2) copia de trabalho p/ limpeza
+df = df_raw.copy()
+df = normalize_cols(df)
+
+# 3) coalesce de colunas importantes (garante retorno do Limite)
+aliases = {
+    "nome": ["nome", "cliente", "nome_cliente"],
+    "celular": ["celular", "telefone", "whatsapp", "whats", "tel", "fone", "contato", "phone"],
+    "loja": ["loja", "unidade", "filial"],
+    "ticket_medio": ["ticket_medio", "ticket", "ticket_médio", "ticket_medio_r$", "ticket_medio_em_r$", "tm"],
+    "limite_disponivel": [
+        "limite_disponivel", "limite_disponível", "limite_disponivel_r$", "limite", "limite_(r$)",
+        "limite_atual", "limite_atual_r$", "credito_disponivel", "credito_disponível"
+    ],
+    "ultima_compra": ["ultima_compra", "última_compra", "data_ultima_compra", "data_da_ultima_compra"],
+    "ultima_transacao": ["ultima_transacao", "última_transacao", "ultima_transação", "data_ultima_transacao"],
+    "cpf": ["cpf", "c_p_f"], # Adiciona "cpf" e possíveis variações aos aliases
+}
+df = coalesce_columns(df, aliases)
+
+
+# 4) assegura campos mínimos
+if "nome" not in df.columns:
+    df["nome"] = None
+if "cpf" not in df.columns: # Garante que a coluna 'cpf' existe
+    df["cpf"] = None
+
+
+# 5) telefone base
+if "celular" in df.columns:
+    df["telefone"] = df["celular"]
+else:
+    guess = [c for c in df.columns if any(k in c for k in ["fone", "tel", "whats", "phone", "contato", "whatsapp", "telefone"])]
+    df["telefone"] = df[guess[0]] if guess else None
+
+# 6) normaliza dados-chave
+df["nome"] = df["nome"].map(clean_name)
+df["fullNumber"] = df["telefone"].map(normalize_br_phone)
+
+# 7) remove cadastros incompletos (nome/telefone inválidos)
+incomplete_removed = df[(df["nome"].isna()) | (df["fullNumber"].isna())].shape[0]
+df = df.dropna(subset=["nome", "fullNumber"]).copy()
+
+# 8) deduplicação por telefone
+dups_before = df.duplicated(subset=["fullNumber"]).sum()
+df = df.groupby("fullNumber", as_index=False, group_keys=False).apply(pick_latest_duplicate).reset_index(drop=True)
+
+# 9) normaliza numéricos (em colunas canônicas) — sem perder colunas originais
+if "ticket_medio" in df.columns:
+    df["ticket_medio_num"] = to_num(df["ticket_medio"])
+else:
+    df["ticket_medio_num"] = None
+
+if "limite_disponivel" in df.columns:
+    df["limite_disponivel_num"] = to_num(df["limite_disponivel"])
+else:
+    df["limite_disponivel_num"] = None
+
+# 10) filtro de potencial
+df, low_potential_removed = filter_low_potential(df)
+
+# 11) e-mail (compat)
+if "email" not in df.columns:
+    df["email"] = None
+
+# 12) TAGS úteis
+def build_tags(row):
+    parts = []
+    for c in ["loja", "uf", "cidade", "status", "financeiro"]:
+        if c in row and pd.notna(row[c]) and str(row[c]).strip() not in ["", "nan", "None"]:
+            parts.append(f"{c}:{str(row[c]).strip()}")
+    return ";".join(parts) if parts else None
+
+df["tags"] = df.apply(build_tags, axis=1)
+
+# 13) Excel de auditoria (mantém TODAS as colunas originais + colunas canônicas e numéricas)
+df_excel = df.copy()
+# nomes amigáveis extras, sem apagar as originais
+rename_friendly = {
+    "ticket_medio": "Ticket_Medio",
+    "limite_disponivel": "Limite_Disponivel",
+    "ticket_medio_num": "Ticket_Medio_Num",
+    "limite_disponivel_num": "Limite_Disponivel_Num"
+}
+for k, v in rename_friendly.items():
+    if k in df_excel.columns and v not in df_excel.columns:
+        df_excel[v] = df_excel[k]
+
+df_excel.to_excel(OUTPUT_XLSX_PATH, index=False)
+
+# 14) CSV final com: Nome, fullNumber, Limite_Disponivel, Ticket_Medio, Loja, CPF
+export_order = ["Nome", "fullNumber", "Limite_Disponivel", "Ticket_Medio", "Loja", "CPF"] # Adiciona "CPF"
+export_map = {
+    "Nome": "nome",
+    "fullNumber": "fullNumber",
+    "Limite_Disponivel": "limite_disponivel_num",  # usa versão numérica limpa
+    "Ticket_Medio": "ticket_medio_num",            # idem
+    "Loja": "loja",
+    "CPF": "cpf", # Mapeia "CPF" para a coluna 'cpf'
+}
+df_csv = pd.DataFrame()
+for out_col, src_col in export_map.items():
+    if src_col in df.columns:
+        df_csv[out_col] = df[src_col]
+    else:
+        df_csv[out_col] = None
+
+
+# arredonda numéricos e formata com vírgula para o CSV
+for col in ["Limite_Disponivel","Ticket_Medio"]:
+    if col in df_csv.columns:
+        # Converte para string, arredonda para 2 casas decimais e substitui '.' por ','
+        df_csv[col] = pd.to_numeric(df_csv[col], errors="coerce").round(2).astype(str).str.replace('.', ',', regex=False)
+
+
+df_csv = df_csv[export_order]
+df_csv.to_csv(OUTPUT_CSV_PATH, index=False, encoding="utf-8")
+
+# 15) relatório + preview
+kept = len(df)
+has_lim = df["limite_disponivel_num"].notna().sum() if "limite_disponivel_num" in df.columns else 0
+print("==== RELATÓRIO DA LIMPEZA ====")
+print(f"Linhas originais................: {orig_rows}")
+print(f"Incompletos removidos...........: {incomplete_removed}")
+print(f"Duplicados removidos (fone).....: {dups_before}")
+print(f"Baixo potencial removido........: {low_potential_removed}  "
+      f"(regras: min_ticket_medio={LOW_POTENTIAL['min_ticket_medio']}, "
+      f"min_limite_disponivel={LOW_POTENTIAL['min_limite_disponivel']})")
+print(f"Linhas finais...................: {kept}")
+print(f"Com Limite_Disponivel válido....: {has_lim}")
+print()
+print("Arquivos gerados:")
+print(f" - Excel (auditoria): {OUTPUT_XLSX_PATH}")
+print(f" - CSV (contatos)   : {OUTPUT_CSV_PATH}")
+
+# Preview rápido
+preview_cols = [c for c in ["nome","fullNumber","limite_disponivel","limite_disponivel_num","ticket_medio","ticket_medio_num","loja", "cpf"] if c in df.columns] # Adiciona "cpf" para preview
+print("\n==== PREVIEW (primeiras 20 linhas) ====")
+print(df[preview_cols].head(20).to_string(index=False))
